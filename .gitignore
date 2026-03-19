@@ -1,0 +1,14 @@
+```
+# Certificate and key files (from generate-certs.sh)
+*.crt
+*.key
+*.pem
+*.csr
+*.der
+*.p12
+*.jks
+
+# Temporary files from certificate generation
+*.srl
+*.conf
+```
