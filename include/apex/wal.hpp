@@ -203,6 +203,206 @@ public:
         return Result<void>::ok();
     }
 
+    // ── Snapshot support ───────────────────────────────────────────────────────
+    //
+    //  Creates a point-in-time snapshot of all entries up to the given index.
+    //  Used for log compaction and state transfer to new/falling-behind peers.
+    Result<void> create_snapshot(const std::string& snapshot_path, uint64_t through_index) noexcept
+    {
+        std::string snap_tmp = snapshot_path + ".tmp";
+        int snap_fd = ::open(snap_tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (snap_fd < 0)
+            return Result<void>::err(Errc::IoError);
+
+        // Write snapshot header: [magic:4][version:4][through_index:8][entry_count:8]
+        uint8_t hdr[24];
+        uint32_t magic = htonl(0xAEC05NAPu);
+        uint32_t version = htonl(1);
+        uint64_t idx_be = htobe64(through_index);
+        uint64_t count_be = 0; // Will be updated
+        memcpy(hdr + 0, &magic, 4);
+        memcpy(hdr + 4, &version, 4);
+        memcpy(hdr + 8, &idx_be, 8);
+        memcpy(hdr + 16, &count_be, 8);
+        if (write(snap_fd, hdr, 24) != 24)
+        {
+            ::close(snap_fd);
+            unlink(snap_tmp.c_str());
+            return Result<void>::err(Errc::IoError);
+        }
+
+        int rd_fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (rd_fd < 0)
+        {
+            ::close(snap_fd);
+            unlink(snap_tmp.c_str());
+            return Result<void>::err(Errc::IoError);
+        }
+
+        uint64_t entry_count = 0;
+        std::lock_guard lk(mtx_);
+        for (;;)
+        {
+            uint8_t rec_hdr[12];
+            if (read(rd_fd, rec_hdr, 12) != 12)
+                break;
+            uint32_t len_be;
+            memcpy(&len_be, rec_hdr + 4, 4);
+            uint32_t data_len = ntohl(len_be);
+            std::vector<uint8_t> data(data_len);
+            if ((uint32_t)read(rd_fd, data.data(), data_len) != data_len)
+                break;
+
+            uint64_t entry_idx = 0;
+            if (data_len >= 16)
+            {
+                memcpy(&entry_idx, data.data() + 8, 8);
+                entry_idx = be64toh(entry_idx);
+            }
+
+            if (entry_idx > through_index)
+                continue;
+
+            // Write entry to snapshot
+            if (write(snap_fd, rec_hdr, 12) != 12)
+                break;
+            if ((uint32_t)write(snap_fd, data.data(), data_len) != data_len)
+                break;
+            entry_count++;
+        }
+
+        ::close(rd_fd);
+
+        // Update entry count in header
+        uint64_t count_be = htobe64(entry_count);
+        lseek(snap_fd, 16, SEEK_SET);
+        if (write(snap_fd, &count_be, 8) != 8)
+        {
+            ::close(snap_fd);
+            unlink(snap_tmp.c_str());
+            return Result<void>::err(Errc::IoError);
+        }
+
+        fdatasync(snap_fd);
+        ::close(snap_fd);
+
+        if (rename(snap_tmp.c_str(), snapshot_path.c_str()) != 0)
+        {
+            unlink(snap_tmp.c_str());
+            return Result<void>::err(Errc::IoError);
+        }
+
+        LOG_INFO("WAL snapshot created: %s through_index=%llu entries=%llu",
+                 snapshot_path.c_str(), (unsigned long long)through_index, (unsigned long long)entry_count);
+        return Result<void>::ok();
+    }
+
+    // Load entries from a snapshot
+    Result<uint64_t> load_snapshot(const std::string& snapshot_path,
+                                    std::function<void(const LogEntry&)> cb) noexcept
+    {
+        int snap_fd = ::open(snapshot_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (snap_fd < 0)
+            return Result<uint64_t>::err(Errc::IoError);
+
+        // Read and verify header
+        uint8_t hdr[24];
+        if (read(snap_fd, hdr, 24) != 24)
+        {
+            ::close(snap_fd);
+            return Result<uint64_t>::err(Errc::Corrupt);
+        }
+
+        uint32_t magic_be, version_be;
+        memcpy(&magic_be, hdr + 0, 4);
+        memcpy(&version_be, hdr + 4, 4);
+
+        if (ntohl(magic_be) != 0xAEC05NAPu)
+        {
+            LOG_ERROR("Snapshot: bad magic");
+            ::close(snap_fd);
+            return Result<uint64_t>::err(Errc::Corrupt);
+        }
+
+        uint64_t through_index, entry_count;
+        memcpy(&through_index, hdr + 8, 8);
+        memcpy(&entry_count, hdr + 16, 8);
+        through_index = be64toh(through_index);
+        entry_count = be64toh(entry_count);
+
+        uint64_t loaded = 0;
+        for (uint64_t i = 0; i < entry_count; i++)
+        {
+            uint8_t rec_hdr[12];
+            if (read(snap_fd, rec_hdr, 12) != 12)
+            {
+                LOG_WARN("Snapshot: truncated at entry %llu", (unsigned long long)i);
+                break;
+            }
+
+            uint32_t len_be;
+            memcpy(&len_be, rec_hdr + 4, 4);
+            uint32_t data_len = ntohl(len_be);
+            std::vector<uint8_t> data(data_len);
+            if ((uint32_t)read(snap_fd, data.data(), data_len) != data_len)
+            {
+                LOG_WARN("Snapshot: truncated data at entry %llu", (unsigned long long)i);
+                break;
+            }
+
+            ByteReader r(data.data(), data_len);
+            LogEntry le;
+            le.term = r.u64();
+            le.index = r.u64();
+            le.op = static_cast<Cmd>(r.u8());
+            le.key = r.str();
+            le.val = r.str();
+            cb(le);
+            loaded++;
+        }
+
+        ::close(snap_fd);
+        LOG_INFO("Snapshot loaded: %s entries=%llu/%llu",
+                 snapshot_path.c_str(), (unsigned long long)loaded, (unsigned long long)entry_count);
+        return Result<uint64_t>::ok(through_index);
+    }
+
+    // Compact WAL by removing entries before a given index (after snapshot)
+    Result<void> compact_before(uint64_t before_index) noexcept
+    {
+        // First create a snapshot of entries we're keeping
+        std::string snapshot_path = path_ + ".snapshot";
+        auto snap_result = create_snapshot(snapshot_path, before_index - 1);
+        if (snap_result.is_err())
+            return snap_result;
+
+        // Replace WAL with empty file (entries are now in snapshot)
+        close();
+        std::string backup = path_ + ".backup";
+        if (rename(path_.c_str(), backup.c_str()) != 0)
+            return Result<void>::err(Errc::IoError);
+
+        // Create fresh WAL
+        fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd_ < 0)
+        {
+            rename(backup.c_str(), path_.c_str());
+            return Result<void>::err(Errc::IoError);
+        }
+
+        LOG_INFO("WAL compacted: removed entries before index %llu", (unsigned long long)before_index);
+        return Result<void>::ok();
+    }
+
+    // Get current WAL size (for monitoring)
+    uint64_t size_bytes() const noexcept
+    {
+        struct stat st;
+        if (fd_ >= 0 && fstat(fd_, &st) == 0)
+            return static_cast<uint64_t>(st.st_size);
+        return 0;
+    }
+
 private:
     Config cfg_;
     std::string path_;
